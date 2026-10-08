@@ -37,7 +37,7 @@ jobs:
         run: |
           docker build --tag "$IMAGE_TAG" .
           docker run --detach --name preview-test --publish 127.0.0.1:8080:80 "$IMAGE_TAG"
-          curl --fail --retry 10 --retry-connrefused --retry-delay 2 http://127.0.0.1:8080/ -o /tmp/served.html
+          curl --fail --retry 10 --retry-all-errors --retry-delay 2 --max-time 5 http://127.0.0.1:8080/ -o /tmp/served.html
           diff html/index.html /tmp/served.html
           test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ci-missing-${{ github.sha }})" = 404
           docker save "$IMAGE_TAG" | gzip > website-image.tar.gz
