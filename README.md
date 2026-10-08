@@ -120,17 +120,7 @@ If this account already has a GitHub OIDC provider (including one created by the
 original root configuration), reuse it by passing
 `-var='github_oidc_provider_arn=arn:aws:iam::340752808446:oidc-provider/token.actions.githubusercontent.com'`
 to both bootstrap plan and apply. Do not create a duplicate provider. Bootstrap
-uses separate local state; back it up securely. For this repository, set the
-following in `terraform/bootstrap/terraform.tfvars` so the trust policy matches
-GitHub's immutable OIDC identity:
-
-```hcl
-github_oidc_subject = "repo:RyanLeary2764@204479055/Test_Web_Server_Reusable@1409531879:environment:preview"
-```
-
-See [GitHub's OIDC trust-policy documentation](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws).
-
- Its role can create and delete
+uses separate local state; back it up securely. Its role can create and delete
 EC2 networking and instances throughout `us-east-1`; use a dedicated lab account.
 It has no IAM administration permission.
 
