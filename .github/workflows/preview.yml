@@ -1,0 +1,111 @@
+name: Website preview
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Ansible
+        run: |
+          pip install -r ansible/requirements.txt
+          ansible-galaxy collection install -r ansible/requirements.yml
+      - name: Validate configuration
+        run: |
+          docker compose config --quiet
+          ansible-playbook -i 'localhost,' ansible/playbook.yml --syntax-check
+          bash -n scripts/deploy.sh
+      - name: Build and smoke test website image
+        env:
+          IMAGE_TAG: silipos-preview:${{ github.sha }}
+        run: |
+          docker build --tag "$IMAGE_TAG" .
+          docker run --detach --name preview-test --publish 127.0.0.1:8080:80 "$IMAGE_TAG"
+          curl --fail --retry 10 --retry-connrefused --retry-delay 2 http://127.0.0.1:8080/ -o /tmp/served.html
+          diff html/index.html /tmp/served.html
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/ci-missing-${{ github.sha }})" = 404
+          docker save "$IMAGE_TAG" | gzip > website-image.tar.gz
+      - name: Container logs
+        if: failure()
+        run: docker logs preview-test || true
+      - name: Stop test container
+        if: always()
+        run: docker rm --force preview-test || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: website-image
+          path: website-image.tar.gz
+          retention-days: 3
+          if-no-files-found: error
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.PREVIEW_DEPLOY_ENABLED == 'true'
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: preview
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      SECURITY_GROUP_ID: ${{ vars.PREVIEW_SECURITY_GROUP_ID }}
+      PREVIEW_HOST: ${{ vars.PREVIEW_HOST }}
+      ANSIBLE_HOST_KEY_CHECKING: 'True'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: website-image
+          path: image
+      - name: Install Ansible
+        run: |
+          pip install -r ansible/requirements.txt
+          ansible-galaxy collection install -r ansible/requirements.yml
+      - name: Prepare verified SSH access and inventory
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PREVIEW_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.PREVIEW_SSH_KNOWN_HOSTS }}
+          IMAGE_TAG: silipos-preview:${{ github.sha }}
+        run: python scripts/prepare-ci.py
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: us-east-1
+      - name: Determine runner IPv4
+        run: |
+          RUNNER_IP=$(curl -4 --fail --silent --show-error https://checkip.amazonaws.com)
+          python -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$RUNNER_IP"
+          echo "RUNNER_CIDR=$RUNNER_IP/32" >> "$GITHUB_ENV"
+      - name: Temporarily allow runner SSH
+        run: |
+          aws ec2 authorize-security-group-ingress --group-id "$SECURITY_GROUP_ID"             --protocol tcp --port 22 --cidr "$RUNNER_CIDR"
+      - name: Deploy tested image with Ansible
+        run: |
+          ansible-playbook -i "$RUNNER_TEMP/preview-deploy/inventory.json"             --private-key "$RUNNER_TEMP/preview-deploy/id_ed25519"             --ssh-common-args "-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/preview-deploy/known_hosts"             --extra-vars "@$RUNNER_TEMP/preview-deploy/vars.json" ansible/playbook.yml
+      - name: Remove runner SSH access
+        if: always() && env.RUNNER_CIDR != ''
+        run: |
+          aws ec2 revoke-security-group-ingress --group-id "$SECURITY_GROUP_ID"             --protocol tcp --port 22 --cidr "$RUNNER_CIDR"
+      - name: Remove temporary deployment credentials
+        if: always()
+        run: python scripts/prepare-ci.py --cleanup
