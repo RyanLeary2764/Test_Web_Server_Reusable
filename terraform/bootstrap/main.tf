@@ -61,6 +61,12 @@ variable "github_repository" {
   default = "RyanLeary2764/Test_Web_Server_Reusable"
 }
 
+variable "github_oidc_subject" {
+  description = "Exact GitHub OIDC subject; set for repositories using immutable owner/repository IDs."
+  type        = string
+  default     = ""
+}
+
 variable "github_oidc_provider_arn" {
   description = "Existing GitHub OIDC provider ARN; empty creates one."
   type        = string
@@ -86,7 +92,7 @@ resource "aws_iam_role" "provision" {
       Condition = {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_repository}:environment:preview"
+          "token.actions.githubusercontent.com:sub" = var.github_oidc_subject != "" ? var.github_oidc_subject : "repo:${var.github_repository}:environment:preview"
         }
       }
     }]
