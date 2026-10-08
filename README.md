@@ -92,9 +92,10 @@ terraform -chdir=terraform destroy
 `.github/workflows/preview.yml` runs validation on pull requests, pushes to `main`,
 and manual runs. It builds the Dockerfile, starts Nginx, checks that the served
 index matches `html/index.html`, checks a missing URL returns 404, and validates
-Compose and Ansible syntax. After validation, pushes to `main` and manual runs
-on `main` deploy the tested image with Ansible. PRs never run the deployment job.
-
+Compose and Ansible syntax. After validation, pushes to `main` and manual runs on `main` create or update the
+EC2 server with Terraform, deploy the tested image, and verify HTTP. PRs never
+provision AWS resources. The server remains running until the separate manual
+**Destroy website preview** workflow is run.
 The image is transferred as a GitHub Actions artifact and loaded into Docker on
 EC2. No container registry or registry password is needed. Each image is tagged
 with its Git commit SHA. CI deployments contain the website inside the image,
@@ -102,51 +103,64 @@ so deleted files disappear on the next deployment. Local Compose still mounts
 `html/` for immediate edits. The manual deployment script uses the original
 file-copy approach; use the pipeline consistently for image-based releases.
 
-### One-time setup
+### One-time setup for workflow-managed infrastructure
 
-1. This project uses https://github.com/RyanLeary2764/Test_Web_Server_Reusable
-   with `main` as the deployment branch.
-2. Set `github_repository = "RyanLeary2764/Test_Web_Server_Reusable"` in `terraform/terraform.tfvars`.
-   If this AWS account already has a GitHub OIDC provider, set
-   `github_oidc_provider_arn` to its ARN so Terraform reuses it.
-3. Initialize, plan, and apply Terraform as described above. Terraform remains a
-   separate infrastructure step; the pipeline manages Docker and Ansible.
-4. In GitHub **Settings → Environments**, create `preview` and restrict deployment
-   branches to `main`. The AWS trust policy permits this repository's `preview`
-   environment. Restricting its branches is part of the access setup.
-5. Add these environment variables and secrets:
+Bootstrap an AWS OIDC role and a private, encrypted, versioned S3 state bucket
+once locally using the `terraform` profile:
+
+```sh
+export AWS_PROFILE=terraform
+terraform -chdir=terraform/bootstrap init
+terraform -chdir=terraform/bootstrap plan
+terraform -chdir=terraform/bootstrap apply
+terraform -chdir=terraform/bootstrap output
+```
+
+If this account already has a GitHub OIDC provider (including one created by the
+original root configuration), reuse it by passing
+`-var='github_oidc_provider_arn=arn:aws:iam::340752808446:oidc-provider/token.actions.githubusercontent.com'`
+to both bootstrap plan and apply. Do not create a duplicate provider. Bootstrap
+uses separate local state; back it up securely. Its role can create and delete
+EC2 networking and instances throughout `us-east-1`; use a dedicated lab account.
+It has no IAM administration permission.
+
+In GitHub Settings → Environments, create `preview` and restrict deployment
+branches to `main`. Configure these environment settings:
 
 | Kind | Name | Value |
 | --- | --- | --- |
-| Variable | `AWS_DEPLOY_ROLE_ARN` | `terraform -chdir=terraform output -raw github_deploy_role_arn` |
-| Variable | `PREVIEW_SECURITY_GROUP_ID` | `terraform -chdir=terraform output -raw preview_security_group_id` |
-| Variable | `PREVIEW_HOST` | `terraform -chdir=terraform output -raw preview_host` |
-| Secret | `PREVIEW_SSH_PRIVATE_KEY` | Full unencrypted CI SSH private key matching Terraform's public key |
-| Secret | `PREVIEW_SSH_KNOWN_HOSTS` | Verified known-hosts entry for the exact `PREVIEW_HOST` IPv4 address |
+| Variable | `AWS_PROVISION_ROLE_ARN` | Bootstrap `provision_role_arn` output |
+| Variable | `TF_STATE_BUCKET` | Bootstrap `state_bucket` output |
+| Variable | `PREVIEW_ALLOWED_CIDR` | Your actual public IPv4 followed by `/32` |
+| Secret | `PREVIEW_SSH_PRIVATE_KEY` | Dedicated unencrypted SSH private key |
 
-Use a dedicated CI SSH key. Verify the server's host key using the AWS EC2 console
-system log or another trusted channel before saving its known-hosts entry. The
-pipeline enforces host-key checking and does not blindly trust `ssh-keyscan`.
+Set repository Actions variable `PREVIEW_DEPLOY_ENABLED` to `true` after setup.
+The previous static host, security group, deployment role, and known-hosts settings
+are unused. The workflow derives the public key from the private key and verifies
+server host keys using authenticated EC2 console output, failing closed if the
+keys are unavailable. Keep the same SSH secret for subsequent deployments.
 
-AWS authentication uses OIDC, so no AWS access-key secrets are required. The role
-can add/remove ingress only on this preview server's security group. Each run
-allows SSH from the GitHub runner's current IPv4 `/32` and removes that rule in an
-`always()` cleanup step. HTTP remains limited to your Terraform `allowed_cidr`.
-After a forced termination or runner loss, check for and remove any leftover
-runner SSH rule. A stopped/restarted or replaced EC2 instance may require updating
-`PREVIEW_HOST` and the verified known-hosts secret.
+Push to `main` or run **Actions → Website preview → Run workflow** on `main`.
+Terraform stores state at `s3://TF_STATE_BUCKET/preview/terraform.tfstate` with
+S3 locking. Both workflows share a concurrency group and backend. Later deploys
+reuse that state instead of creating duplicate infrastructure. SSH access for the
+runner is removed after deployment; HTTP remains restricted to your configured
+CIDR. The preview URL appears in the deployment run summary.
 
-After infrastructure and environment settings are ready, create the **repository**
-Actions variable `PREVIEW_DEPLOY_ENABLED` with value `true`. Until then, the build
-and validation job runs and deployment is skipped. Set it to `false` to pause
-deployments.
+To remove the preview server and network, run **Actions → Destroy website preview
+→ Run workflow** on `main` and type `destroy`. The bootstrap role and state bucket
+remain available so the next deployment can recreate the server. AWS resources
+continue incurring charges until destruction succeeds. Deployment failures retain
+infrastructure in state so you can retry deployment or run the destroy workflow.
+After forced cancellation or runner loss, check for leftover runner SSH rules.
 
-Push an edit to `html/` on `main` to deploy, or use **Actions → Website preview →
-Run workflow** on `main`. A failed HTTP check fails deployment but does not roll
-back automatically. To restore an earlier site, revert the change on `main` and
-let the pipeline deploy the reverted content. Old image tags remain on the host;
-periodically remove unused images with `docker image prune -a` after checking
-which versions you need to retain.
+The workflows use isolated copies of the root Terraform files, excluding local
+state, local tfvars, and the old deployment IAM resources. Any server you already
+created locally remains separate: these workflows will not destroy it. To retire
+that stack, review `terraform -chdir=terraform plan -destroy` locally. If bootstrap
+reuses its OIDC provider, preserve the provider before destroying the old stack;
+do not delete an OIDC provider used by the new workflow role. Migrating the existing
+server into the shared backend requires a separate state migration rather than
+running the new pipeline against empty state.
 
-Reference: [GitHub OIDC for AWS](https://docs.github.com/en/actions/how-tos/secure-your-work/security-harden-deployments/oidc-in-aws)
-and [environment deployment restrictions](https://docs.github.com/en/actions/reference/workflows-and-actions/deployments-and-environments).
+Backend reference: [Terraform S3 backend and locking](https://developer.hashicorp.com/terraform/language/backend/s3).

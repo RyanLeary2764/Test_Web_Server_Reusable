@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: preview-${{ github.ref }}
+  group: preview-infrastructure
   cancel-in-progress: false
 
 jobs:
@@ -30,7 +30,8 @@ jobs:
         run: |
           docker compose config --quiet
           ansible-playbook -i 'localhost,' ansible/playbook.yml --syntax-check
-          bash -n scripts/deploy.sh
+          bash -n scripts/deploy.sh scripts/prepare-infra.sh
+          python -m py_compile scripts/prepare-ci.py scripts/prepare-runtime.py
       - name: Build and smoke test website image
         env:
           IMAGE_TAG: silipos-preview:${{ github.sha }}
@@ -58,15 +59,17 @@ jobs:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && vars.PREVIEW_DEPLOY_ENABLED == 'true'
     needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     environment: preview
     permissions:
       contents: read
       id-token: write
     env:
       AWS_REGION: us-east-1
-      SECURITY_GROUP_ID: ${{ vars.PREVIEW_SECURITY_GROUP_ID }}
-      PREVIEW_HOST: ${{ vars.PREVIEW_HOST }}
+      TF_IN_AUTOMATION: 'true'
+      TF_INPUT: 'false'
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_allowed_cidr: ${{ vars.PREVIEW_ALLOWED_CIDR }}
       ANSIBLE_HOST_KEY_CHECKING: 'True'
     steps:
       - uses: actions/checkout@v4
@@ -81,31 +84,52 @@ jobs:
         run: |
           pip install -r ansible/requirements.txt
           ansible-galaxy collection install -r ansible/requirements.yml
-      - name: Prepare verified SSH access and inventory
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.PREVIEW_SSH_PRIVATE_KEY }}
-          SSH_KNOWN_HOSTS: ${{ secrets.PREVIEW_SSH_KNOWN_HOSTS }}
-          IMAGE_TAG: silipos-preview:${{ github.sha }}
-        run: python scripts/prepare-ci.py
       - uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_PROVISION_ROLE_ARN }}
           aws-region: us-east-1
-      - name: Determine runner IPv4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+          terraform_wrapper: false
+      - name: Prepare shared infrastructure configuration
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PREVIEW_SSH_PRIVATE_KEY }}
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          PREVIEW_ALLOWED_CIDR: ${{ vars.PREVIEW_ALLOWED_CIDR }}
+        run: bash scripts/prepare-infra.sh
+      - name: Create or update preview server
+        run: |
+          terraform -chdir="$RUNNER_TEMP/preview-infra" init -backend-config="bucket=$TF_STATE_BUCKET"
+          terraform -chdir="$RUNNER_TEMP/preview-infra" validate
+          terraform -chdir="$RUNNER_TEMP/preview-infra" plan -out=preview.tfplan
+          terraform -chdir="$RUNNER_TEMP/preview-infra" apply -auto-approve preview.tfplan
+          terraform -chdir="$RUNNER_TEMP/preview-infra" output -json > "$RUNNER_TEMP/preview-outputs.json"
+      - name: Verify SSH host key through AWS and prepare inventory
+        env:
+          IMAGE_TAG: silipos-preview:${{ github.sha }}
+        run: python scripts/prepare-runtime.py
+      - name: Temporarily allow runner SSH
         run: |
           RUNNER_IP=$(curl -4 --fail --silent --show-error https://checkip.amazonaws.com)
           python -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$RUNNER_IP"
-          echo "RUNNER_CIDR=$RUNNER_IP/32" >> "$GITHUB_ENV"
-      - name: Temporarily allow runner SSH
-        run: |
-          aws ec2 authorize-security-group-ingress --group-id "$SECURITY_GROUP_ID"             --protocol tcp --port 22 --cidr "$RUNNER_CIDR"
+          GROUP_ID=$(terraform -chdir="$RUNNER_TEMP/preview-infra" output -raw preview_security_group_id)
+          echo "SECURITY_GROUP_ID=$GROUP_ID" >> "$GITHUB_ENV"
+          RULE_ID=$(aws ec2 authorize-security-group-ingress --group-id "$GROUP_ID" --protocol tcp --port 22 --cidr "$RUNNER_IP/32" --query 'SecurityGroupRules[0].SecurityGroupRuleId' --output text)
+          echo "RUNNER_RULE_ID=$RULE_ID" >> "$GITHUB_ENV"
       - name: Deploy tested image with Ansible
         run: |
           ansible-playbook -i "$RUNNER_TEMP/preview-deploy/inventory.json"             --private-key "$RUNNER_TEMP/preview-deploy/id_ed25519"             --ssh-common-args "-o StrictHostKeyChecking=yes -o UserKnownHostsFile=$RUNNER_TEMP/preview-deploy/known_hosts"             --extra-vars "@$RUNNER_TEMP/preview-deploy/vars.json" ansible/playbook.yml
-      - name: Remove runner SSH access
-        if: always() && env.RUNNER_CIDR != ''
+      - name: Publish preview URL
         run: |
-          aws ec2 revoke-security-group-ingress --group-id "$SECURITY_GROUP_ID"             --protocol tcp --port 22 --cidr "$RUNNER_CIDR"
+          URL=$(terraform -chdir="$RUNNER_TEMP/preview-infra" output -raw preview_url)
+          echo "Preview website: $URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "Access is restricted to PREVIEW_ALLOWED_CIDR. Use the Destroy website preview workflow to remove it." >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove runner SSH access
+        if: always() && env.RUNNER_RULE_ID != ''
+        run: aws ec2 revoke-security-group-ingress --group-id "$SECURITY_GROUP_ID" --security-group-rule-ids "$RUNNER_RULE_ID"
       - name: Remove temporary deployment credentials
         if: always()
-        run: python scripts/prepare-ci.py --cleanup
+        run: |
+          python scripts/prepare-ci.py --cleanup
+          rm -f "$RUNNER_TEMP/preview-key" "$RUNNER_TEMP/preview-key.pub"

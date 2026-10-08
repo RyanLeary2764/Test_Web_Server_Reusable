@@ -1,0 +1,55 @@
+name: Destroy website preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type destroy to remove the preview server and network'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-infrastructure
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    if: github.ref == 'refs/heads/main' && inputs.confirmation == 'destroy'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment: preview
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: us-east-1
+      TF_IN_AUTOMATION: 'true'
+      TF_INPUT: 'false'
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      TF_VAR_allowed_cidr: ${{ vars.PREVIEW_ALLOWED_CIDR }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_PROVISION_ROLE_ARN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.2
+          terraform_wrapper: false
+      - name: Prepare shared infrastructure configuration
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PREVIEW_SSH_PRIVATE_KEY }}
+          PREVIEW_ALLOWED_CIDR: ${{ vars.PREVIEW_ALLOWED_CIDR }}
+        run: bash scripts/prepare-infra.sh
+      - name: Plan and destroy preview infrastructure
+        run: |
+          terraform -chdir="$RUNNER_TEMP/preview-infra" init -backend-config="bucket=$TF_STATE_BUCKET"
+          terraform -chdir="$RUNNER_TEMP/preview-infra" plan -destroy -out=destroy.tfplan
+          terraform -chdir="$RUNNER_TEMP/preview-infra" apply -auto-approve destroy.tfplan
+      - name: Remove temporary SSH credentials
+        if: always()
+        run: rm -f "$RUNNER_TEMP/preview-key" "$RUNNER_TEMP/preview-key.pub"
