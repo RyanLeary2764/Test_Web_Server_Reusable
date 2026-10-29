@@ -3,3 +3,14 @@
 /* Amazon purchase buttons match the catalog orange. */
 .nav-shop,.button-amazon{background:#ff9900;color:#111;border-color:#ff9900}
 .nav-shop:hover,.button-amazon:hover{background:#e68a00;border-color:#e68a00;text-decoration:none}
+
+/* Shared full-width demo header across the home, product, and catalog pages. */
+.site-header{background:#fff}
+.site-header .header{width:calc(100% - 64px);max-width:1600px;gap:clamp(32px,5vw,90px);padding-block:30px}
+.site-header .header>span{flex:0 0 auto}
+.site-header nav{flex:1;justify-content:space-between;gap:24px;font-size:16px}
+.site-header nav>span,.site-header .nav-shop{white-space:nowrap}
+.nav-shop,.button-amazon{border-radius:999px}
+.site-header .nav-shop{display:inline-flex;align-items:center;justify-content:center;padding:14px 24px;text-decoration:none;transition:background .2s}
+@media(max-width:1050px){.site-header .header{gap:28px;flex-wrap:wrap}.site-header nav{flex-basis:100%;gap:20px;flex-wrap:wrap}}
+@media(max-width:600px){.site-header .header{width:calc(100% - 36px);padding-block:22px}.site-header nav{width:100%;font-size:14px;gap:18px 24px}.site-header .nav-shop{padding:12px 20px}}
