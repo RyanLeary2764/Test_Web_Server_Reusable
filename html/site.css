@@ -8,8 +8,8 @@
 .site-header{background:#fff}
 .site-header .header{width:calc(100% - 64px);max-width:1600px;gap:clamp(32px,5vw,90px);padding-block:30px}
 .site-header .header>span{flex:0 0 auto}
-.site-header nav{flex:1;justify-content:space-between;gap:24px;font-size:16px}
-.site-header nav>span,.site-header .nav-shop{white-space:nowrap}
+.site-header nav{flex:1;justify-content:flex-end;gap:clamp(24px,3vw,48px);font-size:16px}
+.site-header nav>span,.site-header nav>a{white-space:nowrap}
 .nav-shop,.button-amazon{border-radius:999px}
 .site-header .nav-shop{display:inline-flex;align-items:center;justify-content:center;padding:14px 24px;text-decoration:none;transition:background .2s}
 @media(max-width:1050px){.site-header .header{gap:28px;flex-wrap:wrap}.site-header nav{flex-basis:100%;gap:20px;flex-wrap:wrap}}
